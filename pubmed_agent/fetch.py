@@ -24,7 +24,10 @@ import requests
 logger = logging.getLogger(__name__)
 
 EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-REQUEST_TIMEOUT = 20  # seconds
+REQUEST_TIMEOUT = 30  # seconds
+
+# Full text can be large; cap what we feed downstream (we still store it all).
+FULL_TEXT_CHAR_CAP = 200_000
 
 
 class PubMedFetchError(Exception):
@@ -40,11 +43,14 @@ class RawArticle:
     journal: str = ""
     publication_date: str = ""
     doi: str = ""
+    pmcid: str = ""
     authors: list[str] = field(default_factory=list)
     abstract_sections: list[dict[str, str]] = field(default_factory=list)
     mesh_terms: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
     publication_types: list[str] = field(default_factory=list)
+    full_text_sections: list[dict[str, str]] = field(default_factory=list)
+    full_text_available: bool = False
 
     def abstract_text(self) -> str:
         """Join structured abstract sections into one block."""
@@ -55,10 +61,22 @@ class RawArticle:
             parts.append(f"{label}: {text}" if label else text)
         return "\n".join(p for p in parts if p)
 
+    def full_text(self) -> str:
+        """Join full-text sections into one block (verbatim)."""
+        parts = []
+        for sec in self.full_text_sections:
+            title = (sec.get("title") or "").strip()
+            text = (sec.get("text") or "").strip()
+            if not text and not title:
+                continue
+            parts.append(f"## {title}\n{text}".strip() if title else text)
+        return "\n\n".join(parts)
+
     def to_flat_text(self) -> str:
         """Render the record as a flat text block for the nano structuring prompt."""
         lines = [
             f"PMID: {self.pmid}",
+            f"PMCID: {self.pmcid or '(none)'}",
             f"Title: {self.title}",
             f"Journal: {self.journal}",
             f"Publication date: {self.publication_date}",
@@ -71,6 +89,11 @@ class RawArticle:
             "Abstract:",
             self.abstract_text() or "(no abstract available)",
         ]
+        if self.full_text_available:
+            full = self.full_text()
+            if len(full) > FULL_TEXT_CHAR_CAP:
+                full = full[:FULL_TEXT_CHAR_CAP] + "\n\n[... full text truncated ...]"
+            lines += ["", "Full text (from PubMed Central):", full]
         return "\n".join(lines)
 
 
@@ -121,11 +144,17 @@ def _parse_article(article: ET.Element, pmid: str) -> RawArticle:
         if eloc.get("EIdType") == "doi" and _text(eloc):
             rec.doi = _text(eloc)
             break
-    if not rec.doi:
-        for aid in article.findall(".//PubmedData/ArticleIdList/ArticleId"):
-            if aid.get("IdType") == "doi" and _text(aid):
-                rec.doi = _text(aid)
-                break
+    # PMC id + DOI fallback — both live in the ArticleIdList.
+    for aid in article.findall(".//PubmedData/ArticleIdList/ArticleId"):
+        id_type = aid.get("IdType")
+        value = _text(aid)
+        if not value:
+            continue
+        if id_type == "doi" and not rec.doi:
+            rec.doi = value
+        elif id_type == "pmc":
+            # Normalize to "PMC1234567".
+            rec.pmcid = value if value.upper().startswith("PMC") else f"PMC{value}"
 
     # Abstract — may be split into labelled sections (structured abstract).
     for abst in article.findall(".//Article/Abstract/AbstractText"):
@@ -153,15 +182,170 @@ def _parse_article(article: ET.Element, pmid: str) -> RawArticle:
     return rec
 
 
+# --------------------------------------------------------------------------- #
+# PubMed Central full-text (JATS XML) — robust, namespace-agnostic parsing
+# --------------------------------------------------------------------------- #
+# JATS in the wild is inconsistent: some feeds carry XML namespaces, sections
+# may lack titles, content paragraphs sometimes sit loose in <body>, nesting can
+# be deep, and figures/tables/boxed-text appear anywhere. We match elements by
+# their *local* tag name (ignoring any namespace) and walk defensively so the
+# parser degrades gracefully instead of throwing on an unfamiliar layout.
+
+_BLOCK_TAGS = {"p", "list", "disp-quote", "statement", "verse-group", "speech"}
+_CAPTIONED_TAGS = {"fig", "table-wrap", "boxed-text", "supplementary-material"}
+_MAX_SECTION_DEPTH = 12  # runaway guard for pathological nesting
+
+
+def _local(tag: str) -> str:
+    """Strip any XML namespace, returning the bare local tag name."""
+    if isinstance(tag, str) and "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def _first_child(el: ET.Element, name: str) -> ET.Element | None:
+    for child in el:
+        if _local(child.tag) == name:
+            return child
+    return None
+
+
+def _caption_entry(el: ET.Element) -> dict[str, str] | None:
+    """Build a {title, text} entry from a <fig>/<table-wrap>/<boxed-text> node."""
+    label = ""
+    cap_parts: list[str] = []
+    for child in el:
+        ln = _local(child.tag)
+        if ln == "label":
+            label = _text(child)
+        elif ln in ("caption", "title"):
+            t = _text(child)
+            if t:
+                cap_parts.append(t)
+    text = "\n".join(p for p in cap_parts if p)
+    if not text:
+        return None
+    return {"title": label or _local(el.tag).replace("-", " ").title(), "text": text}
+
+
+def _walk_section(sec: ET.Element, prefix: str, out: list[dict[str, str]], depth: int) -> None:
+    if depth > _MAX_SECTION_DEPTH:
+        return
+    title_el = _first_child(sec, "title")
+    title = _text(title_el) if title_el is not None else ""
+    full_title = f"{prefix} › {title}" if prefix and title else (title or prefix)
+
+    # Direct block content of THIS section only (nested <sec> handled by recursion,
+    # so itertext on leaf blocks never double-counts subsection text).
+    body_parts: list[str] = []
+    for child in sec:
+        ln = _local(child.tag)
+        if ln in _BLOCK_TAGS:
+            txt = _text(child)
+            if txt:
+                body_parts.append(txt)
+    if body_parts:
+        out.append({"title": full_title or "Section", "text": "\n\n".join(body_parts)})
+
+    # Figures/tables/boxes anchored in this section, then recurse subsections — in order.
+    for child in sec:
+        ln = _local(child.tag)
+        if ln in _CAPTIONED_TAGS:
+            entry = _caption_entry(child)
+            if entry:
+                out.append(entry)
+        elif ln == "sec":
+            _walk_section(child, full_title, out, depth + 1)
+
+
+def _flush_loose(loose: list[str], out: list[dict[str, str]]) -> None:
+    if loose:
+        out.append({"title": "", "text": "\n\n".join(loose)})
+        loose.clear()
+
+
+def _parse_pmc_body(root: ET.Element) -> list[dict[str, str]]:
+    """Parse a JATS article body into an ordered list of {title, text} sections."""
+    body = next((el for el in root.iter() if _local(el.tag) == "body"), None)
+    if body is None:
+        return []
+
+    out: list[dict[str, str]] = []
+    loose: list[str] = []
+    for child in body:
+        ln = _local(child.tag)
+        if ln == "sec":
+            _flush_loose(loose, out)
+            _walk_section(child, "", out, 0)
+        elif ln in _BLOCK_TAGS:
+            txt = _text(child)
+            if txt:
+                loose.append(txt)
+        elif ln in _CAPTIONED_TAGS:
+            _flush_loose(loose, out)
+            entry = _caption_entry(child)
+            if entry:
+                out.append(entry)
+    _flush_loose(loose, out)
+    return out
+
+
+def fetch_pmc_fulltext(
+    pmcid: str,
+    *,
+    api_key: str | None = None,
+    tool: str | None = None,
+    email: str | None = None,
+) -> list[dict[str, str]]:
+    """
+    Fetch and parse PMC full text (JATS XML) for a PMCID.
+
+    Returns an ordered list of {title, text} sections (possibly empty if the
+    article has no machine-readable body). Raises PubMedFetchError on a bad
+    PMCID, network failure, or unparseable XML.
+    """
+    num = (pmcid or "").upper().replace("PMC", "").strip()
+    if not num.isdigit():
+        raise PubMedFetchError(f"'{pmcid}' is not a valid PMCID.")
+
+    params: dict[str, str] = {"db": "pmc", "id": num, "retmode": "xml"}
+    if api_key:
+        params["api_key"] = api_key
+    if tool:
+        params["tool"] = tool
+    if email:
+        params["email"] = email
+
+    logger.info("Fetching full text for PMC%s", num)
+    try:
+        resp = requests.get(EFETCH_URL, params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise PubMedFetchError(f"PMC full-text request failed for PMC{num}: {exc}") from exc
+
+    try:
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as exc:
+        raise PubMedFetchError(f"Could not parse PMC XML for PMC{num}: {exc}") from exc
+
+    return _parse_pmc_body(root)
+
+
 def fetch_pubmed_record(
     pmid: str,
     *,
+    include_full_text: bool = True,
     api_key: str | None = None,
     tool: str | None = None,
     email: str | None = None,
 ) -> RawArticle:
     """
     Fetch and parse a single PubMed record by PMID.
+
+    When `include_full_text` is set and the article has a PMCID, the PMC full
+    text is fetched and attached. A full-text failure never fails the record —
+    it logs a warning and returns the abstract-level record (`full_text_available`
+    stays False).
 
     Raises PubMedFetchError on an invalid PMID, network failure, or a PMID that
     PubMed returns no article for.
@@ -202,4 +386,19 @@ def fetch_pubmed_record(
     record = _parse_article(article, pmid)
     if not record.title:
         logger.warning("PMID %s parsed with no title — record may be incomplete", pmid)
+
+    if include_full_text and record.pmcid:
+        try:
+            sections = fetch_pmc_fulltext(
+                record.pmcid, api_key=api_key, tool=tool, email=email
+            )
+            record.full_text_sections = sections
+            record.full_text_available = bool(sections)
+            logger.info(
+                "PMID %s: attached %d full-text sections from %s",
+                pmid, len(sections), record.pmcid,
+            )
+        except PubMedFetchError as exc:
+            logger.warning("Full text unavailable for %s: %s", record.pmcid, exc)
+
     return record

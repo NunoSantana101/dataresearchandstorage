@@ -1,14 +1,17 @@
 """
-Nano structuring agent.
+Nano analysis agent.
 
-Takes a raw PubMed record (from fetch.py) and runs a single GPT-5.4-nano pass to
-produce a clean, machine-readable JSON envelope: normalized bibliographic fields,
-a sectioned abstract, extracted key findings, and a plain-language summary.
+Takes a raw PubMed record (from fetch.py — bibliographic metadata, abstract, and
+PMC full text when available) and runs a single GPT-5.4-nano pass that produces an
+*analysis* layer: study type, key findings, per-section summaries, and a
+plain-language summary.
 
-This mirrors the sAImone `nano_agent` pattern (Responses API, low reasoning
-effort, parse `output_text`, strip fences, json.loads). It is deliberately a thin,
-swappable unit so the same "fetch → nano → JSON" pattern can later be lifted into
-the sAImone backend.
+Design note: the faithful, verbatim data (title, authors, abstract sections, full
+text, MeSH, etc.) is carried straight from the parser into the final envelope —
+nano never re-emits it, so there's no hallucination risk and far fewer output
+tokens. Nano only adds the analytical fields. This mirrors the sAImone nano
+pattern (Responses API, low reasoning effort, parse output_text, strip fences,
+json.loads) with a deterministic fallback so the UI always renders.
 """
 
 from __future__ import annotations
@@ -26,46 +29,35 @@ logger = logging.getLogger(__name__)
 
 NANO_MODEL = "gpt-5.4-nano"
 NANO_REASONING_EFFORT = "low"
-NANO_MAX_TOKENS = 4000
-NANO_TIMEOUT = 120  # seconds
+NANO_MAX_TOKENS = 6000  # headroom for per-section summaries on long full-text reviews
+NANO_TIMEOUT = 180  # seconds
 
-# The contract the model must emit. Kept as plain text (not strict json_schema)
-# because nano follows an explicit example reliably and it keeps the unit simple.
-NANO_INSTRUCTIONS = """You are a biomedical literature structuring agent for a medical-affairs platform.
+# Analytical contract only — bibliographic data is supplied deterministically.
+NANO_INSTRUCTIONS = """You are a biomedical literature analysis agent for a medical-affairs platform.
 
-You receive the raw record of a single PubMed article. Your job is to return a
-clean JSON object — and nothing else (no prose, no markdown fences).
+You receive one PubMed record: bibliographic metadata, the abstract, and — when
+the article is open-access in PubMed Central — its FULL TEXT.
+
+Return ONLY a JSON object (no prose, no markdown fences) with exactly this shape:
+{
+  "study_type": "string",
+  "key_findings": ["string"],
+  "section_summaries": [{"section": "string", "summary": "string"}],
+  "plain_summary": "string"
+}
 
 Rules:
-- Use ONLY information present in the provided record. Do NOT invent or infer
-  facts that are not in the source. If a field is unknown, use an empty string or
-  empty list.
-- "abstract_sections": split the abstract into its logical sections. If the source
-  already labels sections (Background, Methods, Results, Conclusions), preserve
-  those labels. If the abstract is a single block, return one section with an empty
-  label.
-- "key_findings": 2-6 short bullet statements capturing the article's concrete
-  results/conclusions, drawn strictly from the abstract.
-- "plain_summary": 2-3 sentences a non-specialist can understand.
-- "study_type": a short tag based on the publication types / abstract (e.g.
-  "randomized controlled trial", "review", "observational study", "case report",
-  "unknown").
-
-Return exactly this JSON shape:
-{
-  "pmid": "string",
-  "title": "string",
-  "journal": "string",
-  "publication_date": "string",
-  "doi": "string",
-  "authors": ["string"],
-  "study_type": "string",
-  "abstract_sections": [{"label": "string", "text": "string"}],
-  "key_findings": ["string"],
-  "mesh_terms": ["string"],
-  "keywords": ["string"],
-  "plain_summary": "string"
-}"""
+- Use ONLY information present in the provided record. Never invent or infer facts
+  that are not in the source.
+- "study_type": a short tag, e.g. "randomized controlled trial", "review",
+  "observational study", "in silico / computational", "meta-analysis",
+  "case report", "unknown".
+- "key_findings": 3-8 short, concrete result/conclusion statements. If full text
+  is present, draw on the Methods/Results/Conclusions — not only the abstract.
+- "section_summaries": if full text is present, one entry per MAJOR section
+  (use the section's own heading as "section", a 1-3 sentence "summary"). If NO
+  full text is present, return an empty list [].
+- "plain_summary": 2-3 sentences a non-specialist can understand."""
 
 
 def _extract_output_text(response: Any) -> str:
@@ -94,21 +86,76 @@ def _strip_fences(raw: str) -> str:
     return cleaned.strip()
 
 
-def _fallback_payload(record: RawArticle) -> dict[str, Any]:
-    """Deterministic structuring from the parsed record when nano is unavailable/fails."""
+def _faithful_fields(record: RawArticle) -> dict[str, Any]:
+    """Verbatim, parser-sourced data that nano must NOT regenerate."""
     return {
         "pmid": record.pmid,
+        "pmcid": record.pmcid,
         "title": record.title,
         "journal": record.journal,
         "publication_date": record.publication_date,
         "doi": record.doi,
         "authors": record.authors,
-        "study_type": (record.publication_types[0].lower() if record.publication_types else "unknown"),
-        "abstract_sections": record.abstract_sections or [],
-        "key_findings": [],
+        "abstract_sections": record.abstract_sections,
         "mesh_terms": record.mesh_terms,
         "keywords": record.keywords,
+        "publication_types": record.publication_types,
+        "full_text_available": record.full_text_available,
+        "full_text_sections": record.full_text_sections,
+        "source_url": f"https://pubmed.ncbi.nlm.nih.gov/{record.pmid}/",
+        "pmc_url": (
+            f"https://www.ncbi.nlm.nih.gov/pmc/articles/{record.pmcid}/"
+            if record.pmcid else ""
+        ),
+        "doi_url": f"https://doi.org/{record.doi}" if record.doi else "",
+    }
+
+
+def _fallback_analysis(record: RawArticle) -> dict[str, Any]:
+    """Deterministic analysis layer when nano is unavailable/fails."""
+    return {
+        "study_type": (
+            record.publication_types[0].lower() if record.publication_types else "unknown"
+        ),
+        "key_findings": [],
+        "section_summaries": [],
         "plain_summary": "",
+    }
+
+
+def _run_nano(record: RawArticle, *, api_key: str, model: str, meta: dict[str, Any]) -> dict[str, Any]:
+    """Run nano, returning only the analytical fields. Raises on any failure."""
+    client = OpenAI(api_key=api_key)
+    user_input = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": f"PubMed record to analyze:\n\n{record.to_flat_text()}"}
+            ],
+        }
+    ]
+    response = client.responses.create(
+        model=model,
+        input=user_input,
+        instructions=NANO_INSTRUCTIONS,
+        max_output_tokens=NANO_MAX_TOKENS,
+        reasoning={"effort": NANO_REASONING_EFFORT},
+        truncation="auto",
+        store=False,
+        timeout=NANO_TIMEOUT,
+    )
+    meta["response_id"] = getattr(response, "id", None)
+    status = getattr(response, "status", None)
+    if status and status != "completed":
+        raise ValueError(f"nano response status={status}")
+
+    parsed = json.loads(_strip_fences(_extract_output_text(response)))
+    # Keep only the analytical contract; ignore anything else nano emits.
+    return {
+        "study_type": str(parsed.get("study_type") or "unknown"),
+        "key_findings": list(parsed.get("key_findings") or []),
+        "section_summaries": list(parsed.get("section_summaries") or []),
+        "plain_summary": str(parsed.get("plain_summary") or ""),
     }
 
 
@@ -119,59 +166,29 @@ def structure_record(
     model: str = NANO_MODEL,
 ) -> dict[str, Any]:
     """
-    Run nano over a raw PubMed record and return a structured dict.
+    Produce the final structured envelope: faithful parser data + nano analysis.
 
-    The returned dict always carries a "_meta" block describing how it was produced
-    (model, elapsed seconds, OpenAI response id, and whether the deterministic
-    fallback was used). Never raises for model issues — falls back to a
-    deterministic structuring so the UI always has something to render.
+    Always carries a "_meta" block (model, elapsed seconds, response id, fallback
+    flag). Never raises for model issues — falls back to a deterministic analysis
+    so the UI always has something to render.
     """
-    client = OpenAI(api_key=api_key)
-    flat = record.to_flat_text()
-    user_input = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": f"PubMed record to structure:\n\n{flat}"}
-            ],
-        }
-    ]
-
     start = time.monotonic()
     meta: dict[str, Any] = {"model": model, "fallback": False, "response_id": None}
+
     try:
-        response = client.responses.create(
-            model=model,
-            input=user_input,
-            instructions=NANO_INSTRUCTIONS,
-            max_output_tokens=NANO_MAX_TOKENS,
-            reasoning={"effort": NANO_REASONING_EFFORT},
-            truncation="auto",
-            store=False,
-            timeout=NANO_TIMEOUT,
-        )
-        meta["response_id"] = getattr(response, "id", None)
-
-        status = getattr(response, "status", None)
-        if status and status != "completed":
-            raise ValueError(f"nano response status={status}")
-
-        raw_text = _extract_output_text(response)
-        payload = json.loads(_strip_fences(raw_text))
-        # Guard: nano must at least echo the PMID; trust the source PMID regardless.
-        payload["pmid"] = record.pmid
+        analysis = _run_nano(record, api_key=api_key, model=model, meta=meta)
     except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("nano structuring failed (%s); using deterministic fallback", exc)
-        payload = _fallback_payload(record)
-        meta["fallback"] = True
-        meta["error"] = str(exc)
+        logger.warning("nano analysis failed (%s); using deterministic fallback", exc)
+        analysis = _fallback_analysis(record)
+        meta.update(fallback=True, error=str(exc))
     except Exception as exc:  # network / auth / SDK errors
         logger.warning("nano call errored (%s); using deterministic fallback", exc)
-        payload = _fallback_payload(record)
-        meta["fallback"] = True
-        meta["error"] = str(exc)
+        analysis = _fallback_analysis(record)
+        meta.update(fallback=True, error=str(exc))
 
     meta["elapsed_seconds"] = round(time.monotonic() - start, 2)
-    payload["source_url"] = f"https://pubmed.ncbi.nlm.nih.gov/{record.pmid}/"
+
+    payload = _faithful_fields(record)
+    payload.update(analysis)
     payload["_meta"] = meta
     return payload

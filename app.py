@@ -94,11 +94,20 @@ def render_record(payload: dict) -> None:
     if journal:
         bib.append(f"*{journal}*")
     if doi:
-        bib.append(f"DOI: [{doi}](https://doi.org/{doi})")
+        bib.append(f"DOI: [{doi}]({payload.get('doi_url') or f'https://doi.org/{doi}'})")
     if payload.get("source_url"):
         bib.append(f"[View on PubMed]({payload['source_url']})")
+    if payload.get("pmc_url"):
+        bib.append(f"[PMC full text]({payload['pmc_url']})")
     if bib:
         st.markdown(" · ".join(bib))
+
+    # Full-text availability badge.
+    n_full = len(payload.get("full_text_sections") or [])
+    if payload.get("full_text_available"):
+        st.markdown(f"✅ **Full text retrieved** from PMC — {n_full} sections.")
+    else:
+        st.markdown("ℹ️ **Abstract only** — no open-access full text in PMC for this article.")
 
     authors = payload.get("authors") or []
     if authors:
@@ -122,6 +131,16 @@ def render_record(payload: dict) -> None:
         for f in findings:
             st.markdown(f"- {f}")
 
+    # Per-section summaries (nano, full text only).
+    summaries = payload.get("section_summaries") or []
+    if summaries:
+        st.markdown("### 🧭 Section-by-section summary")
+        for s in summaries:
+            section = (s.get("section") or "").strip()
+            summary = (s.get("summary") or "").strip()
+            if summary:
+                st.markdown(f"**{section or 'Section'}** — {summary}")
+
     # Abstract sections.
     sections = payload.get("abstract_sections") or []
     if sections:
@@ -134,6 +153,19 @@ def render_record(payload: dict) -> None:
             if label:
                 st.markdown(f"**{label.title()}**")
             st.write(text)
+
+    # Verbatim full text (collapsed — can be long).
+    full_sections = payload.get("full_text_sections") or []
+    if full_sections:
+        with st.expander(f"📚 Full text — verbatim from PMC ({len(full_sections)} sections)"):
+            for sec in full_sections:
+                title = (sec.get("title") or "").strip()
+                text = (sec.get("text") or "").strip()
+                if not text:
+                    continue
+                if title:
+                    st.markdown(f"#### {title}")
+                st.write(text)
 
     # Indexing terms.
     mesh = payload.get("mesh_terms") or []
@@ -162,7 +194,10 @@ st.caption(
 )
 
 with st.form("collect"):
-    pmid_in = st.text_input("PMID", placeholder="e.g. 38000000")
+    pmid_in = st.text_input("PMID", placeholder="e.g. 42101477")
+    want_full_text = st.checkbox(
+        "Follow & retrieve full text (PMC, when open-access)", value=True
+    )
     submitted = st.form_submit_button("Collect", type="primary")
 
 if submitted:
@@ -177,9 +212,14 @@ if submitted:
         )
 
     try:
-        with st.spinner(f"Fetching PMID {pmid} from NCBI…"):
+        spin_msg = (
+            f"Fetching PMID {pmid} + full text from NCBI…"
+            if want_full_text else f"Fetching PMID {pmid} from NCBI…"
+        )
+        with st.spinner(spin_msg):
             record = fetch_pubmed_record(
                 pmid,
+                include_full_text=want_full_text,
                 api_key=ncbi_key or None,
                 tool=ncbi_tool or None,
                 email=ncbi_email or None,
