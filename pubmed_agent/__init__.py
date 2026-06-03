@@ -5,6 +5,7 @@ from .fetch import (
     RawArticle,
     fetch_pmc_fulltext,
     fetch_pubmed_record,
+    resolve_full_text,
 )
 from .nano_agent import NANO_MODEL, structure_record
 
@@ -13,6 +14,7 @@ __all__ = [
     "RawArticle",
     "fetch_pubmed_record",
     "fetch_pmc_fulltext",
+    "resolve_full_text",
     "structure_record",
     "NANO_MODEL",
 ]

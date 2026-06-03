@@ -101,7 +101,9 @@ def _faithful_fields(record: RawArticle) -> dict[str, Any]:
         "keywords": record.keywords,
         "publication_types": record.publication_types,
         "full_text_available": record.full_text_available,
+        "full_text_source": record.full_text_source,
         "full_text_sections": record.full_text_sections,
+        "oa_locations": record.oa_locations,
         "source_url": f"https://pubmed.ncbi.nlm.nih.gov/{record.pmid}/",
         "pmc_url": (
             f"https://www.ncbi.nlm.nih.gov/pmc/articles/{record.pmcid}/"

@@ -102,12 +102,33 @@ def render_record(payload: dict) -> None:
     if bib:
         st.markdown(" · ".join(bib))
 
-    # Full-text availability badge.
+    # Full-text availability badge + source.
     n_full = len(payload.get("full_text_sections") or [])
+    oa = payload.get("oa_locations") or []
+    source_label = {
+        "pmc": "PubMed Central",
+        "europepmc": "Europe PMC",
+        "pdf:unpaywall": "OA PDF (extracted, unstructured)",
+    }.get(payload.get("full_text_source"), payload.get("full_text_source") or "unknown")
+
     if payload.get("full_text_available"):
-        st.markdown(f"✅ **Full text retrieved** from PMC — {n_full} sections.")
+        st.markdown(f"✅ **Full text retrieved** via **{source_label}** — {n_full} sections.")
+    elif oa:
+        st.markdown(
+            "🔓 **Open-access full text found but not auto-parsed.** "
+            "Links below lead to the free PDF/landing page."
+        )
     else:
-        st.markdown("ℹ️ **Abstract only** — no open-access full text in PMC for this article.")
+        st.markdown("ℹ️ **Abstract only** — no retrievable open-access full text found.")
+
+    # Open-access links (from Unpaywall) — always show when present.
+    if oa:
+        link_parts = []
+        for loc in oa:
+            kind = loc.get("host_type") or "source"
+            ver = f" · {loc['version']}" if loc.get("version") else ""
+            link_parts.append(f"[{kind}{ver}]({loc['url']})")
+        st.markdown("**Open-access links:** " + " · ".join(link_parts))
 
     authors = payload.get("authors") or []
     if authors:
