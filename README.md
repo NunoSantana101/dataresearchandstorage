@@ -16,7 +16,10 @@ target and will reuse the same fetch → structure → store layout.
    required for casual use).
 3. **Full text follow-through** via a retrieval ladder (many "free" articles live
    outside PMC, each publisher exposing full text differently):
-   1. **PubMed Central** JATS (`db=pmc`) — cleanest, when a PMCID exists
+   1. **PubMed Central** JATS (`db=pmc`) — cleanest, when a PMCID exists.
+      The PubMed record often *omits* the PMC id, so when it's missing the PMCID
+      is resolved via NCBI's **ID Converter** (catches articles that are in PMC
+      but look like they aren't).
    2. **Europe PMC** full-text XML — broader coverage, same JATS parser, free, no key
    3. **Unpaywall** (DOI → legal open-access locations) — surfaces the free
       PDF/landing link even when no machine-readable XML exists

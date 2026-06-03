@@ -40,6 +40,7 @@ def _load_pdf_reader():
         return None
 
 EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+IDCONV_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
 EUROPEPMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 EUROPEPMC_FULLTEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/{source}/{ext_id}/fullTextXML"
 UNPAYWALL_URL = "https://api.unpaywall.org/v2/{doi}"
@@ -439,6 +440,39 @@ def fetch_pmc_fulltext(
 # failing source never sinks the others.
 
 
+def _resolve_pmcid(
+    pmid: str, *, tool: str | None = None, email: str | None = None, timeout: int = REQUEST_TIMEOUT
+) -> str:
+    """Resolve PMID -> PMCID via NCBI's ID Converter.
+
+    The PubMed efetch record's <ArticleIdList> frequently omits the PMC id (e.g.
+    when the PMC deposit post-dates the PubMed record), so an article can be fully
+    available in PMC while looking like it has no full text. The ID Converter is
+    the canonical PMID<->PMCID resolver and catches exactly those cases.
+
+    Returns 'PMC#######' or '' if there's no PMC version (or on failure).
+    """
+    if not pmid:
+        return ""
+    params = {"ids": pmid, "format": "json"}
+    if tool:
+        params["tool"] = tool
+    if email:
+        params["email"] = email
+    try:
+        resp = requests.get(IDCONV_URL, params=params, timeout=timeout, headers=_HTTP_HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("ID Converter lookup failed for PMID %s: %s", pmid, exc)
+        return ""
+    for rec in data.get("records", []):
+        pmcid = rec.get("pmcid")
+        if pmcid:
+            return pmcid if pmcid.upper().startswith("PMC") else f"PMC{pmcid}"
+    return ""
+
+
 def _europepmc_lookup(pmid: str, doi: str, timeout: int) -> dict[str, Any] | None:
     """Find the Europe PMC record for a PMID (preferred) or DOI."""
     if pmid:
@@ -564,7 +598,13 @@ def resolve_full_text(
 
     Never raises — each strategy degrades to empty so the record always returns.
     """
-    # 1) PubMed Central JATS.
+    # 1) PubMed Central JATS. The PubMed record often omits the PMC id, so resolve
+    #    it via the ID Converter when missing, and backfill it onto the record.
+    if not record.pmcid:
+        resolved = _resolve_pmcid(record.pmid, tool=tool, email=email, timeout=timeout)
+        if resolved:
+            logger.info("PMID %s: PMCID %s resolved via ID Converter", record.pmid, resolved)
+            record.pmcid = resolved
     if record.pmcid:
         try:
             sections = fetch_pmc_fulltext(record.pmcid, api_key=api_key, tool=tool, email=email)
