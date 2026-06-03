@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Streamlit secrets (never commit real keys)
+.streamlit/secrets.toml
+
+# Collected PubMed records (local test output)
+data/*.json
+!data/.gitkeep
+
+# OS
+.DS_Store

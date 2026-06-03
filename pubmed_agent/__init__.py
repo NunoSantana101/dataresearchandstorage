@@ -1,0 +1,12 @@
+"""PubMed-by-PMID collection agent: fetch (NCBI E-utils) → nano structuring → JSON."""
+
+from .fetch import PubMedFetchError, RawArticle, fetch_pubmed_record
+from .nano_agent import NANO_MODEL, structure_record
+
+__all__ = [
+    "PubMedFetchError",
+    "RawArticle",
+    "fetch_pubmed_record",
+    "structure_record",
+    "NANO_MODEL",
+]
