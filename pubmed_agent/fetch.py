@@ -115,20 +115,93 @@ def _text(el: ET.Element | None) -> str:
     return "".join(el.itertext()).strip()
 
 
+_MONTHS = {
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+    "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+}
+
+
+def _norm_month(month: str) -> str:
+    """Normalize a PubMed month (name, number, or season) to a zero-padded number, or ''."""
+    month = (month or "").strip()
+    if not month:
+        return ""
+    if month.isdigit():
+        return month.zfill(2)
+    return _MONTHS.get(month[:3].lower(), "")  # '' for seasons (Spring/Fall/…)
+
+
+def _format_date(year: str, month: str, day: str) -> str:
+    """Render a (year, month, day) triple as a sortable ISO-ish date.
+
+    Returns 'YYYY-MM-DD', 'YYYY-MM', or 'YYYY' depending on what's present.
+    Empty if there's no year.
+    """
+    year = (year or "").strip()
+    if not year:
+        return ""
+    mm = _norm_month(month)
+    if not mm:
+        return year
+    parts = [year, mm]
+    day = (day or "").strip()
+    if day.isdigit():
+        parts.append(day.zfill(2))
+    return "-".join(parts)
+
+
+def _date_from_el(el: ET.Element | None) -> str:
+    """Format a date from an element carrying <Year>/<Month>/<Day> children."""
+    if el is None:
+        return ""
+    return _format_date(
+        _text(el.find("Year")), _text(el.find("Month")), _text(el.find("Day"))
+    )
+
+
+def _extract_publication_date(article: ET.Element) -> str:
+    """Best publication date for sorting/recency.
+
+    Prefer the article's electronic publication date (<ArticleDate>, which is the
+    actual e-pub date) over the journal issue's cover date (<JournalIssue>/<PubDate>,
+    which is frequently an end-of-period placeholder like '31 Dec'). Fall back to the
+    History epublish/pubmed dates, then the issue cover date / MedlineDate.
+    """
+    # 1) <ArticleDate> — the electronic publication date (DateType defaults to Electronic).
+    for adate in article.findall(".//Article/ArticleDate"):
+        if (adate.get("DateType") or "Electronic") == "Electronic":
+            iso = _date_from_el(adate)
+            if iso:
+                return iso
+
+    # 2) History pub dates — epublish first, then the pubmed entry date.
+    history = {
+        ppd.get("PubStatus"): ppd
+        for ppd in article.findall(".//PubmedData/History/PubMedPubDate")
+    }
+    for status in ("epublish", "pubmed", "entrez"):
+        iso = _date_from_el(history.get(status))
+        if iso:
+            return iso
+
+    # 3) Journal issue cover date (coarse / placeholder), then MedlineDate string.
+    pubdate = article.find(".//Article/Journal/JournalIssue/PubDate")
+    if pubdate is not None:
+        iso = _date_from_el(pubdate)
+        if iso:
+            return iso
+        return _text(pubdate.find("MedlineDate"))
+    return ""
+
+
 def _parse_article(article: ET.Element, pmid: str) -> RawArticle:
     rec = RawArticle(pmid=pmid)
 
     rec.title = _text(article.find(".//Article/ArticleTitle"))
     rec.journal = _text(article.find(".//Article/Journal/Title"))
 
-    # Publication date — prefer the article's PubDate, fall back to medline date.
-    pubdate = article.find(".//Article/Journal/JournalIssue/PubDate")
-    if pubdate is not None:
-        year = _text(pubdate.find("Year"))
-        month = _text(pubdate.find("Month"))
-        day = _text(pubdate.find("Day"))
-        medline = _text(pubdate.find("MedlineDate"))
-        rec.publication_date = " ".join(p for p in (year, month, day) if p) or medline
+    # Publication date — actual e-pub date preferred over the issue cover date.
+    rec.publication_date = _extract_publication_date(article)
 
     # Authors — "ForeName LastName", fall back to CollectiveName.
     for author in article.findall(".//Article/AuthorList/Author"):

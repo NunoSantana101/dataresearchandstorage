@@ -81,7 +81,7 @@ Provide them via `.streamlit/secrets.toml`, environment, or the sidebar inputs.
   "pmcid": "string",                       // "" if not in PMC
   "title": "string",
   "journal": "string",
-  "publication_date": "string",
+  "publication_date": "string",            // e-pub date, ISO (YYYY-MM-DD), sortable
   "doi": "string",
   "authors": ["string"],
   "abstract_sections": [{"label": "string", "text": "string"}],
